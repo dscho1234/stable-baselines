@@ -40,10 +40,43 @@ def _worker(remote, parent_remote, env_fn_wrapper):
                 remote.send(getattr(env, data))
             elif cmd == 'set_attr':
                 remote.send(setattr(env, data[0], data[1]))
+            #dscho mod
+            elif cmd == 'get_agent_spaces':
+                remote.send(env.agent_space)
+            elif cmd == 'get_goal_spaces':
+                remote.send(env.goal_space)
+            elif cmd == 'obs2each_state':
+                env_state, agent_state = env.obs2each_state(data)
+                remote.send((env_state, agent_state))
+            elif cmd == 'q_control_type':
+                remote.send(env.q_control_type)
+            elif cmd == 'act_dim':
+                remote.send((env.ur3_act_dim, env.gripper_act_dim))
+            elif cmd =='dt':
+                remote.send(env.dt)
+            elif cmd =='_get_ur3_qpos':
+                ur3_qpos = env.env._get_ur3_qpos()
+                remote.send(ur3_qpos)
+            elif cmd =='get_endeff_pos':
+                ee_pos = env.env.get_endeff_pos(data)
+                remote.send(ee_pos)
+            elif cmd =='_get_my_obs_dict':
+                obs_dict = env.env._get_my_obs_dict()
+                remote.send(obs_dict)
+            elif cmd =='get_mid_reward_done':
+                mid_reward, mid_done, mid_info = env.env.get_mid_reward_done(data[0], data[1], data[2], data[3], data[4], data[5])  
+                remote.send((mid_reward, mid_done, mid_info))
+            elif cmd =='_get_agent_obs':
+                agent_obs = env.env._get_agent_obs(data)
+                remote.send(agent_obs)
+            elif cmd =='inverse_kinematics_ee':
+                q_des, iter_taken, err, null_obj = env.env.inverse_kinematics_ee(data[0], data[1], data[2])
+                remote.send((q_des, iter_taken, err, null_obj))
             else:
                 raise NotImplementedError
         except EOFError:
             break
+    
 
 
 class SubprocVecEnv(VecEnv):
@@ -74,7 +107,7 @@ class SubprocVecEnv(VecEnv):
     def __init__(self, env_fns, start_method=None):
         self.waiting = False
         self.closed = False
-        n_envs = len(env_fns)
+        self.n_envs = n_envs = len(env_fns)
 
         if start_method is None:
             # Fork is not a thread safe method (see issue #217)
@@ -198,3 +231,228 @@ def _flatten_obs(obs, space):
         return tuple((np.stack([o[i] for o in obs]) for i in range(obs_len)))
     else:
         return np.stack(obs)
+
+
+
+
+#dscho mod
+class DSSubprocVecEnv(SubprocVecEnv):
+    def __init__(self, env_fn, start_method = None, name = None):
+        super(DSSubprocVecEnv, self).__init__(env_fn, start_method)
+        self.name = name
+        self.remotes[0].send(('get_env_agent_spaces', None))
+        env_state_space, agent_state_space = self.remotes[0].recv()
+        self.remotes[0].send(('get_goal_spaces', None))
+        goal_space = self.remotes[0].recv()
+        
+        self.env_state_space = env_state_space
+        self.agent_state_space = agent_state_space
+        self.goal_space = goal_space
+    # Note : below codes are not for parallelizing, just util functions
+    def obs2each_state(self, observations):
+        # assert len(self.remotes)==1, 'this method is not for parallel env'
+        self.obs2each_state_async(observations)
+        return self.obs2each_state_wait()
+
+    def obs2each_state_async(self, observations):
+        # for remote, observation in zip(self.remotes, observations): 
+        #     remote.send(('obs2each_state', observation))
+
+        self.remotes[0].send(('obs2each_state', observations)) #[ts, dim]
+        self.waiting = True
+
+    def obs2each_state_wait(self):    
+        # results = [remote.recv() for remote in self.remotes]
+        # env_states, agent_states = zip(*results)
+        # return np.stack(env_states), np.stack(agent_states)
+        results = [self.remotes[0].recv()]
+
+        self.waiting = False
+        env_states, agent_states = zip(*results) #return (~, ) and ~ is  [ts, dim] or [dim, ]
+        return env_states[0], agent_states[0]
+        
+
+#dscho mod
+class UR3SubprocVecEnv(SubprocVecEnv):
+    def __init__(self, env_fn, start_method = None, name = None):
+        super(UR3SubprocVecEnv, self).__init__(env_fn, start_method)
+        self.name = name
+
+        self.remotes[0].send(('dt', None))
+        dt = self.remotes[0].recv()
+        self.dt = dt
+        
+        self.remotes[0].send(('q_control_type', None))
+        q_control_type = self.remotes[0].recv()
+        self.q_control_type = q_control_type
+
+        self.remotes[0].send(('act_dim', None))
+        ur3_act_dim, gripper_act_dim = self.remotes[0].recv()
+        self.ur3_act_dim = ur3_act_dim
+        self.gripper_act_dim = gripper_act_dim
+        
+        self.remotes[0].send(('get_goal_spaces', None))
+        goal_space = self.remotes[0].recv()
+        self.goal_space = goal_space
+
+        self.remotes[0].send(('get_agent_spaces', None))
+        agent_space = self.remotes[0].recv()
+        self.agent_space = agent_space
+
+    def step_async(self, actions):
+        for remote, action in zip(self.remotes, actions):
+            command = {
+                'ur3': {'type': self.q_control_type, 'command': action[:2*self.ur3_act_dim]},
+                'gripper': {'type': 'forceg', 'command': action[-2*self.gripper_act_dim:]}
+            }
+            remote.send(('step', command))
+        self.waiting = True
+
+    def step_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        obs, rews, dones, infos = zip(*results)
+        return _flatten_obs(obs, self.observation_space), np.stack(rews), np.stack(dones), infos
+
+    def _get_ur3_qpos(self):
+        self._get_ur3_qpos_async()
+        return self._get_ur3_qpos_wait()
+
+    def _get_ur3_qpos_async(self):
+        for remote in self.remotes: 
+            remote.send(('_get_ur3_qpos', None))
+        self.waiting = True
+
+    def _get_ur3_qpos_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        ur3_qpos = results
+        return np.stack(ur3_qpos)
+
+    def inverse_kinematics_ee(self, ee_poss, so3_constraint_ftn, arm):
+        self.inverse_kinematics_ee_async(ee_poss, so3_constraint_ftn, arm)
+        return self.inverse_kinematics_ee_wait()
+    
+    #TODO: it can't process different so3 constraint or arm.  only ee_poss
+    def inverse_kinematics_ee_async(self, ee_poss, so3_constraint_ftn, arm):
+        for remote, ee_pos in zip(self.remotes, ee_poss):
+            remote.send(('inverse_kinematics_ee', (ee_pos, so3_constraint_ftn, arm)))
+        self.waiting = True
+
+    def inverse_kinematics_ee_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        q_dess, iter_takens, errs, null_objs = zip(*results)
+        return np.stack(q_dess), np.stack(iter_takens), np.stack(errs), np.stack(null_objs)
+        
+    def get_endeff_pos(self, arm):
+        self.get_endeff_pos_async(arm)
+        return self.get_endeff_pos_wait()
+
+    def get_endeff_pos_async(self, arm):
+        for remote in self.remotes: 
+            remote.send(('get_endeff_pos', arm))
+        self.waiting = True
+
+    def get_endeff_pos_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        endeff_pos = results
+        return np.stack(endeff_pos)
+
+    def _get_my_obs_dict(self):
+        self._get_my_obs_dict_async()
+        return self._get_my_obs_dict_wait()
+
+    def _get_my_obs_dict_async(self):
+        for remote in self.remotes:
+            remote.send(('_get_my_obs_dict', None))
+        self.waiting=True
+
+    def _get_my_obs_dict_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        # obs_dicts = zip(*results)
+        obs_dicts = results
+        
+        obs_list, hand_list, second_hand_list, objPos_list, objQuat_list, placingGoal_list, obj_grasp_point_list, second_obj_grasp_point_list, q_des_list, agent_obs_list, second_agent_obs_list = \
+            [], [], [], [], [], [], [], [], [], [], []
+        for obs_dict in obs_dicts:
+            assert isinstance(obs_dict, dict)
+            obs_list.append(obs_dict['state_observation'])
+            hand_list.append(obs_dict['state_hand'])
+            second_hand_list.append(obs_dict['state_second_hand'])
+            objPos_list.append(obs_dict['state_obj_pos'])
+            objQuat_list.append(obs_dict['state_obj_quat'])
+            placingGoal_list.append(obs_dict['state_desired_goal'])
+            obj_grasp_point_list.append(obs_dict['state_grasp_point'])
+            second_obj_grasp_point_list.append(obs_dict['state_second_grasp_point'])
+            q_des_list.append(obs_dict['state_desired_qpos'])
+            agent_obs_list.append(obs_dict['state_agent_obs'])
+            second_agent_obs_list.append(obs_dict['state_second_agent_obs'])
+        obs = np.stack([_ for _ in obs_list], axis =0)
+        hand = np.stack([_ for _ in hand_list], axis =0)
+        second_hand = np.stack([_ for _ in second_hand_list], axis =0)
+        objPos = np.stack([_ for _ in objPos_list], axis =0)
+        objQuat = np.stack([_ for _ in objQuat_list], axis =0)
+        placingGoal = np.stack([_ for _ in placingGoal_list], axis =0)
+        obj_grasp_point = np.stack([_ for _ in obj_grasp_point_list], axis =0)
+        second_obj_grasp_point = np.stack([_ for _ in second_obj_grasp_point_list], axis =0)
+        q_des = np.stack([_ for _ in q_des_list], axis =0)
+        agent_obs = np.stack([_ for _ in agent_obs_list], axis =0)
+        second_agent_obs = np.stack([_ for _ in second_agent_obs_list], axis =0)
+
+        return dict(
+            state_observation=obs,
+            state_hand=hand,
+            state_second_hand = second_hand,
+            state_obj_pos = objPos,
+            state_obj_quat = objQuat,
+            state_grasp_point = obj_grasp_point, 
+            state_second_grasp_point = second_obj_grasp_point,
+            state_desired_goal=placingGoal,
+            state_desired_qpos = q_des,
+            state_agent_obs = agent_obs,
+            state_second_agent_obs = second_agent_obs,\
+            )
+
+    # mid_temp_rew2, mid_done2 = env.get_mid_reward_done(obs_dict, action2, 'left')
+    def get_mid_reward_done(self, obs_dict, mid_acts, final_goals, final_goal_q_dess, arm, dense_rewards=None):
+        if dense_rewards == None:
+            dense_rewards = np.array([False]*self.n_envs)
+        self.get_mid_reward_done_async(obs_dict, mid_acts, final_goals, final_goal_q_dess, arm, dense_rewards)
+        return self.get_mid_reward_done_wait()
+
+    def get_mid_reward_done_async(self, obs_dict, mid_acts, final_goals, final_goal_q_dess, arm, dense_rewards):
+        # obs_dict : dictionary consist of [bs, dim]
+        # parallel_size = obs_dict[list(obs_dict.keys())[0]].shape[0]
+        for remote, (parallel_idx, mid_act), final_goal, final_goal_q_des, dense_reward in zip(self.remotes, enumerate(mid_acts), final_goals, final_goal_q_dess, dense_rewards):
+            individual_obs_dict = {}
+            for key, value in obs_dict.items():    
+                individual_obs_dict[key] = value[parallel_idx]
+            remote.send(('get_mid_reward_done', (individual_obs_dict, mid_act, final_goal, final_goal_q_des, arm, dense_reward)))
+        self.waiting = True
+
+    def get_mid_reward_done_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        mid_rewards, mid_dones, mid_infos = zip(*results)
+        return np.stack(mid_rewards), np.stack(mid_dones), np.stack(mid_infos)
+
+
+    # mid_next_obs2 = env._get_agent_obs('left')
+    def _get_agent_obs(self, arm):
+        self._get_agent_obs_async(arm)
+        return self._get_agent_obs_wait()
+
+    def _get_agent_obs_async(self, arm):
+        for remote in self.remotes:
+            remote.send(('_get_agent_obs', arm))
+        self.waiting = True
+
+    def _get_agent_obs_wait(self):
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        agent_obs = results
+        return np.stack(agent_obs)
+
